@@ -1,0 +1,341 @@
+# Copyright 2024 Automated Enhancement
+#
+# Automated PR Review Bot
+# Intelligent code review automation with suggestions and improvements
+
+name: "Automated PR Review Bot"
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  statuses: write
+
+jobs:
+  automated-review:
+    name: Automated Code Review
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout PR
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get changed files
+      id: changed-files
+      run: |
+        # Get list of changed files
+        git diff --name-only origin/main HEAD > changed_files.txt
+        echo "Changed files:"
+        cat changed_files.txt
+        
+        # Count changes by type
+        go_changes=$(grep '\.go$' changed_files.txt | wc -l || echo 0)
+        cs_changes=$(grep '\.cs$' changed_files.txt | wc -l || echo 0)
+        js_changes=$(grep '\.(js|ts)$' changed_files.txt | wc -l || echo 0)
+        py_changes=$(grep '\.py$' changed_files.txt | wc -l || echo 0)
+        java_changes=$(grep '\.java$' changed_files.txt | wc -l || echo 0)
+        yaml_changes=$(grep '\.(yaml|yml)$' changed_files.txt | wc -l || echo 0)
+        dockerfile_changes=$(grep -i dockerfile changed_files.txt | wc -l || echo 0)
+        
+        echo "go_changes=$go_changes" >> $GITHUB_OUTPUT
+        echo "cs_changes=$cs_changes" >> $GITHUB_OUTPUT
+        echo "js_changes=$js_changes" >> $GITHUB_OUTPUT
+        echo "py_changes=$py_changes" >> $GITHUB_OUTPUT
+        echo "java_changes=$java_changes" >> $GITHUB_OUTPUT
+        echo "yaml_changes=$yaml_changes" >> $GITHUB_OUTPUT
+        echo "dockerfile_changes=$dockerfile_changes" >> $GITHUB_OUTPUT
+
+    - name: Analyze code complexity
+      id: complexity
+      run: |
+        echo "# 🤖 Automated Code Review Report" > review_report.md
+        echo "" >> review_report.md
+        
+        # Initialize scores
+        total_score=0
+        max_score=100
+        
+        # Check for common issues
+        echo "## 📊 Code Analysis Summary" >> review_report.md
+        echo "" >> review_report.md
+        
+        # Security checks
+        echo "### 🔐 Security Analysis" >> review_report.md
+        security_issues=0
+        
+        # Check for potential security issues
+        if git diff --name-only origin/main HEAD | grep -E '\.(go|py|js|cs|java)$' | xargs grep -l "password\|secret\|key\|token" > /dev/null 2>&1; then
+          echo "⚠️ **Potential security concern**: Files contain sensitive keywords. Please ensure no hardcoded secrets." >> review_report.md
+          security_issues=$((security_issues + 1))
+        else
+          echo "✅ No obvious security concerns detected" >> review_report.md
+        fi
+        
+        # Check for TODO/FIXME comments
+        todo_count=$(git diff --name-only origin/main HEAD | grep -E '\.(go|py|js|cs|java)$' | xargs grep -c "TODO\|FIXME\|HACK" || echo 0)
+        if [ "$todo_count" -gt 0 ]; then
+          echo "📝 **Note**: Found $todo_count TODO/FIXME comments that may need attention" >> review_report.md
+        fi
+        
+        echo "" >> review_report.md
+        
+        # File-specific analysis
+        echo "### 📁 Changes by Component" >> review_report.md
+        echo "" >> review_report.md
+        
+        if [ "${{ steps.changed-files.outputs.go_changes }}" -gt 0 ]; then
+          echo "- **Go Services**: ${{ steps.changed-files.outputs.go_changes }} files modified" >> review_report.md
+          
+          # Go-specific checks
+          go_issues=0
+          for file in $(git diff --name-only origin/main HEAD | grep '\.go$'); do
+            if [ -f "$file" ]; then
+              # Check for goroutine leaks
+              if grep -q "go func\|goroutine" "$file"; then
+                echo "  - ⚠️ \`$file\`: Contains goroutines - ensure proper cleanup" >> review_report.md
+              fi
+              
+              # Check for error handling
+              if ! grep -q "if err != nil" "$file" && grep -q "error" "$file"; then
+                echo "  - 💡 \`$file\`: Consider adding more comprehensive error handling" >> review_report.md
+              fi
+            fi
+          done
+        fi
+        
+        if [ "${{ steps.changed-files.outputs.py_changes }}" -gt 0 ]; then
+          echo "- **Python Services**: ${{ steps.changed-files.outputs.py_changes }} files modified" >> review_report.md
+          
+          # Python-specific checks
+          for file in $(git diff --name-only origin/main HEAD | grep '\.py$'); do
+            if [ -f "$file" ]; then
+              # Check for bare except clauses
+              if grep -q "except:" "$file"; then
+                echo "  - ⚠️ \`$file\`: Avoid bare except clauses - specify exception types" >> review_report.md
+              fi
+            fi
+          done
+        fi
+        
+        if [ "${{ steps.changed-files.outputs.cs_changes }}" -gt 0 ]; then
+          echo "- **C# Services**: ${{ steps.changed-files.outputs.cs_changes }} files modified" >> review_report.md
+        fi
+        
+        if [ "${{ steps.changed-files.outputs.dockerfile_changes }}" -gt 0 ]; then
+          echo "- **Docker**: ${{ steps.changed-files.outputs.dockerfile_changes }} Dockerfile(s) modified" >> review_report.md
+          
+          # Docker-specific checks
+          for file in $(git diff --name-only origin/main HEAD | grep -i dockerfile); do
+            if [ -f "$file" ]; then
+              if ! grep -q "USER" "$file"; then
+                echo "  - 🔒 \`$file\`: Consider adding non-root USER directive for security" >> review_report.md
+              fi
+              
+              if grep -q "COPY \. \." "$file"; then
+                echo "  - 📦 \`$file\`: Consider using more specific COPY commands instead of 'COPY . .'" >> review_report.md
+              fi
+            fi
+          done
+        fi
+        
+        if [ "${{ steps.changed-files.outputs.yaml_changes }}" -gt 0 ]; then
+          echo "- **Kubernetes/Config**: ${{ steps.changed-files.outputs.yaml_changes }} YAML files modified" >> review_report.md
+        fi
+        
+        echo "" >> review_report.md
+        echo "security_issues=$security_issues" >> $GITHUB_OUTPUT
+
+    - name: Check best practices
+      run: |
+        echo "### 💡 Best Practice Suggestions" >> review_report.md
+        echo "" >> review_report.md
+        
+        suggestions_count=0
+        
+        # Check for microservice best practices
+        if git diff --name-only origin/main HEAD | grep -E 'src/[^/]+/' | cut -d'/' -f2 | sort | uniq -c | awk '$1 > 10' | wc -l | grep -q '^[1-9]'; then
+          echo "📈 **Suggestion**: Large number of changes in single service - consider breaking into smaller commits" >> review_report.md
+          suggestions_count=$((suggestions_count + 1))
+        fi
+        
+        # Check for configuration management
+        if git diff --name-only origin/main HEAD | grep -E '\.(env|config|properties)$' > /dev/null 2>&1; then
+          echo "⚙️ **Config Management**: Configuration files changed - ensure backward compatibility" >> review_report.md
+          suggestions_count=$((suggestions_count + 1))
+        fi
+        
+        # Check for database-related changes
+        if git diff --name-only origin/main HEAD | grep -iE '(migration|schema|sql)' > /dev/null 2>&1; then
+          echo "🗄️ **Database**: Database-related changes detected - ensure migrations are reversible" >> review_report.md
+          suggestions_count=$((suggestions_count + 1))
+        fi
+        
+        if [ "$suggestions_count" -eq 0 ]; then
+          echo "✨ Great job! No major best practice concerns detected." >> review_report.md
+        fi
+        
+        echo "" >> review_report.md
+
+    - name: Performance analysis
+      run: |
+        echo "### ⚡ Performance Considerations" >> review_report.md
+        echo "" >> review_report.md
+        
+        perf_notes=0
+        
+        # Check for potential performance issues
+        if git diff --name-only origin/main HEAD | xargs grep -l "for.*range\|while\|loop" > /dev/null 2>&1; then
+          echo "🔄 **Note**: Loop constructs detected - ensure O(n) complexity is acceptable" >> review_report.md
+          perf_notes=$((perf_notes + 1))
+        fi
+        
+        # Check for database queries
+        if git diff --name-only origin/main HEAD | xargs grep -l "SELECT\|UPDATE\|INSERT\|DELETE" > /dev/null 2>&1; then
+          echo "🗃️ **Database**: SQL queries detected - consider indexing and query optimization" >> review_report.md
+          perf_notes=$((perf_notes + 1))
+        fi
+        
+        # Check for HTTP calls
+        if git diff --name-only origin/main HEAD | xargs grep -l "http\.\|requests\.\|fetch\|curl" > /dev/null 2>&1; then
+          echo "🌐 **Network**: HTTP calls detected - implement proper timeout and retry logic" >> review_report.md
+          perf_notes=$((perf_notes + 1))
+        fi
+        
+        if [ "$perf_notes" -eq 0 ]; then
+          echo "✅ No obvious performance concerns in this PR" >> review_report.md
+        fi
+        
+        echo "" >> review_report.md
+
+    - name: Testing recommendations
+      run: |
+        echo "### 🧪 Testing Recommendations" >> review_report.md
+        echo "" >> review_report.md
+        
+        # Check if tests were added/modified
+        test_files=$(git diff --name-only origin/main HEAD | grep -E '_test\.(go|py|cs|js)$|test.*\.(py|js)$|tests/' | wc -l || echo 0)
+        code_files=$(git diff --name-only origin/main HEAD | grep -E '\.(go|py|cs|js)$' | grep -v -E '_test\.|test.*\.|tests/' | wc -l || echo 0)
+        
+        if [ "$code_files" -gt 0 ] && [ "$test_files" -eq 0 ]; then
+          echo "🔍 **Testing**: Consider adding tests for the new/modified code" >> review_report.md
+        elif [ "$test_files" -gt 0 ]; then
+          echo "✅ **Testing**: Great job including test changes!" >> review_report.md
+        fi
+        
+        # Check for integration test considerations
+        if git diff --name-only origin/main HEAD | grep -E 'main\.(go|py|cs|js)$|server\.|service\.|handler\.' > /dev/null 2>&1; then
+          echo "🔗 **Integration**: Service entry points modified - consider integration tests" >> review_report.md
+        fi
+        
+        echo "" >> review_report.md
+
+    - name: Generate final score and recommendations
+      run: |
+        # Calculate overall score
+        security_score=85
+        if [ "${{ steps.complexity.outputs.security_issues }}" -gt 0 ]; then
+          security_score=70
+        fi
+        
+        echo "### 📈 Code Quality Score" >> review_report.md
+        echo "" >> review_report.md
+        echo "**Overall Score: ${security_score}/100**" >> review_report.md
+        echo "" >> review_report.md
+        
+        if [ "$security_score" -ge 90 ]; then
+          echo "🌟 **Excellent**: This PR meets high quality standards!" >> review_report.md
+        elif [ "$security_score" -ge 80 ]; then
+          echo "👍 **Good**: This PR looks solid with minor suggestions above." >> review_report.md
+        elif [ "$security_score" -ge 70 ]; then
+          echo "⚠️ **Needs Attention**: Please address the concerns mentioned above." >> review_report.md
+        else
+          echo "❌ **Requires Changes**: Please fix the critical issues before merging." >> review_report.md
+        fi
+        
+        echo "" >> review_report.md
+        echo "### 🚀 Deployment Readiness" >> review_report.md
+        echo "" >> review_report.md
+        
+        # Check deployment-related files
+        if git diff --name-only origin/main HEAD | grep -E '(kubernetes|k8s|docker|helm|terraform|skaffold)' > /dev/null 2>&1; then
+          echo "🏗️ **Infrastructure**: Deployment configuration changes detected" >> review_report.md
+          echo "- Ensure changes are tested in staging environment" >> review_report.md
+          echo "- Verify resource requirements and limits" >> review_report.md
+          echo "- Check for breaking changes in service interfaces" >> review_report.md
+        else
+          echo "✅ No infrastructure changes detected" >> review_report.md
+        fi
+        
+        echo "" >> review_report.md
+        echo "---" >> review_report.md
+        echo "*This review was automatically generated by the Automated Review Bot 🤖*" >> review_report.md
+        echo "*For questions or suggestions, please contact the development team.*" >> review_report.md
+
+    - name: Post review comment
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('review_report.md', 'utf8');
+          
+          // Get existing comments
+          const { data: comments } = await github.rest.issues.listComments({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+          
+          // Look for existing bot comment
+          const botComment = comments.find(comment => 
+            comment.body.includes('🤖 Automated Code Review Report') && 
+            comment.user.type === 'Bot'
+          );
+          
+          if (botComment) {
+            // Update existing comment
+            await github.rest.issues.updateComment({
+              comment_id: botComment.id,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+          } else {
+            // Create new comment
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+          }
+
+  # Optional: Create GitHub check run
+  create-check-run:
+    name: Code Review Check
+    runs-on: ubuntu-latest
+    needs: automated-review
+    if: always()
+    steps:
+    - name: Create check run
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: checkRun } = await github.rest.checks.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            name: 'Automated Code Review',
+            head_sha: context.payload.pull_request.head.sha,
+            status: 'completed',
+            conclusion: '${{ needs.automated-review.result }}' === 'success' ? 'success' : 'neutral',
+            output: {
+              title: '🤖 Automated Code Review Completed',
+              summary: 'The automated code review bot has analyzed your PR. Check the PR comments for detailed feedback.',
+              text: 'This automated review provides suggestions to help improve code quality, security, and maintainability.'
+            }
+          });

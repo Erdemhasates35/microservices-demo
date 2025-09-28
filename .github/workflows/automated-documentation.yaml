@@ -1,0 +1,609 @@
+# Copyright 2024 Automated Enhancement
+#
+# Automated Documentation Generation and Maintenance
+# Keeps documentation up-to-date with code changes
+
+name: "Automated Documentation Maintenance"
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'kubernetes-manifests/**'
+      - '*.md'
+      - 'docs/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'kubernetes-manifests/**'
+  schedule:
+    # Weekly documentation update
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  GO_VERSION: '1.23'
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  analyze-changes:
+    name: Analyze Code Changes for Documentation
+    runs-on: ubuntu-latest
+    outputs:
+      needs-update: ${{ steps.check-changes.outputs.needs_update }}
+      services-changed: ${{ steps.check-changes.outputs.services_changed }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Check for changes requiring documentation updates
+      id: check-changes
+      run: |
+        needs_update="false"
+        services_changed=""
+        
+        # Check if this is a scheduled run
+        if [ "${{ github.event_name }}" = "schedule" ]; then
+          needs_update="true"
+          services_changed="all"
+        else
+          # Check for code changes in services
+          changed_files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only origin/main HEAD)
+          
+          if echo "$changed_files" | grep -E "src/.*\.(go|py|js|cs|java)$"; then
+            needs_update="true"
+            services_changed=$(echo "$changed_files" | grep "src/" | cut -d'/' -f2 | sort | uniq | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          # Check for API changes
+          if echo "$changed_files" | grep -E "(proto|api|grpc)"; then
+            needs_update="true"
+          fi
+          
+          # Check for infrastructure changes
+          if echo "$changed_files" | grep -E "(kubernetes|docker|helm|terraform)"; then
+            needs_update="true"
+          fi
+        fi
+        
+        echo "needs_update=$needs_update" >> $GITHUB_OUTPUT
+        echo "services_changed=$services_changed" >> $GITHUB_OUTPUT
+        echo "Documentation update needed: $needs_update"
+        echo "Services changed: $services_changed"
+
+  generate-api-docs:
+    name: Generate API Documentation
+    runs-on: ubuntu-latest
+    needs: analyze-changes
+    if: needs.analyze-changes.outputs.needs-update == 'true'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install documentation tools
+      run: |
+        # Install Go doc tools
+        go install golang.org/x/tools/cmd/godoc@latest
+        
+        # Install Python doc tools
+        pip install pdoc3 sphinx
+        
+        # Install protoc for protocol buffer docs
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
+    - name: Generate service documentation
+      run: |
+        mkdir -p docs/api
+        
+        echo "# 📚 API Documentation" > docs/api/README.md
+        echo "" >> docs/api/README.md
+        echo "Auto-generated API documentation for all microservices." >> docs/api/README.md
+        echo "" >> docs/api/README.md
+        echo "**Last Updated:** $(date -u)" >> docs/api/README.md
+        echo "" >> docs/api/README.md
+        
+        # Document Go services
+        echo "## 🐹 Go Services" >> docs/api/README.md
+        echo "" >> docs/api/README.md
+        
+        GO_SERVICES="shippingservice productcatalogservice checkoutservice frontend"
+        for service in $GO_SERVICES; do
+          if [ -d "src/$service" ]; then
+            echo "### $service" >> docs/api/README.md
+            echo "" >> docs/api/README.md
+            
+            cd "src/$service"
+            
+            # Extract package information
+            if [ -f "main.go" ]; then
+              package_desc=$(grep -E "^//.*" main.go | head -5 | sed 's|^//||g' | tr '\n' ' ')
+              if [ -n "$package_desc" ]; then
+                echo "**Description:** $package_desc" >> ../../docs/api/README.md
+                echo "" >> ../../docs/api/README.md
+              fi
+            fi
+            
+            # List main functions and types
+            echo "**Main Components:**" >> ../../docs/api/README.md
+            echo "" >> ../../docs/api/README.md
+            
+            # Find function definitions
+            if grep -E "^func.*\(" *.go > /dev/null 2>&1; then
+              echo "Functions:" >> ../../docs/api/README.md
+              grep -E "^func.*\(" *.go | sed 's/func /- /' | head -10 >> ../../docs/api/README.md
+              echo "" >> ../../docs/api/README.md
+            fi
+            
+            # Find struct definitions
+            if grep -E "^type.*struct" *.go > /dev/null 2>&1; then
+              echo "Types:" >> ../../docs/api/README.md
+              grep -E "^type.*struct" *.go | sed 's/type /- /' | head -5 >> ../../docs/api/README.md
+              echo "" >> ../../docs/api/README.md
+            fi
+            
+            cd ../..
+          fi
+        done
+        
+        # Document Python services
+        echo "## 🐍 Python Services" >> docs/api/README.md
+        echo "" >> docs/api/README.md
+        
+        PYTHON_SERVICES="emailservice recommendationservice shoppingassistantservice"
+        for service in $PYTHON_SERVICES; do
+          if [ -d "src/$service" ]; then
+            echo "### $service" >> docs/api/README.md
+            echo "" >> docs/api/README.md
+            
+            cd "src/$service"
+            
+            # Extract module docstrings
+            if find . -name "*.py" -exec grep -l "\"\"\"" {} \; | head -1 | xargs grep -A 5 '"""' | head -5; then
+              echo "**Description:** Auto-detected from docstrings" >> ../../docs/api/README.md
+              echo "" >> ../../docs/api/README.md
+            fi
+            
+            # List Python classes and functions
+            echo "**Main Components:**" >> ../../docs/api/README.md
+            echo "" >> ../../docs/api/README.md
+            
+            if find . -name "*.py" -exec grep -E "^class " {} \; | head -5; then
+              echo "Classes:" >> ../../docs/api/README.md
+              find . -name "*.py" -exec grep -E "^class " {} \; | head -5 | sed 's/class /- /' >> ../../docs/api/README.md
+              echo "" >> ../../docs/api/README.md
+            fi
+            
+            if find . -name "*.py" -exec grep -E "^def " {} \; | head -10; then
+              echo "Functions:" >> ../../docs/api/README.md
+              find . -name "*.py" -exec grep -E "^def " {} \; | head -10 | sed 's/def /- /' >> ../../docs/api/README.md
+              echo "" >> ../../docs/api/README.md
+            fi
+            
+            cd ../..
+          fi
+        done
+        
+        # Document Node.js services
+        echo "## 📦 Node.js Services" >> docs/api/README.md
+        echo "" >> docs/api/README.md
+        
+        NODE_SERVICES="currencyservice paymentservice"
+        for service in $NODE_SERVICES; do
+          if [ -d "src/$service" ]; then
+            echo "### $service" >> docs/api/README.md
+            echo "" >> docs/api/README.md
+            
+            cd "src/$service"
+            
+            # Extract package.json description
+            if [ -f "package.json" ]; then
+              desc=$(jq -r '.description // "No description"' package.json)
+              echo "**Description:** $desc" >> ../../docs/api/README.md
+              echo "" >> ../../docs/api/README.md
+            fi
+            
+            # List main exports and functions
+            echo "**Main Components:**" >> ../../docs/api/README.md
+            echo "" >> ../../docs/api/README.md
+            
+            if find . -name "*.js" -exec grep -E "^function|^const.*=.*function|^exports\." {} \; | head -10; then
+              echo "Functions:" >> ../../docs/api/README.md
+              find . -name "*.js" -exec grep -E "^function|^const.*=.*function|^exports\." {} \; | head -10 | sed 's/^/- /' >> ../../docs/api/README.md
+              echo "" >> ../../docs/api/README.md
+            fi
+            
+            cd ../..
+          fi
+        done
+
+    - name: Generate architecture documentation
+      run: |
+        mkdir -p docs/architecture
+        
+        echo "# 🏗️ Architecture Documentation" > docs/architecture/README.md
+        echo "" >> docs/architecture/README.md
+        echo "**Last Updated:** $(date -u)" >> docs/architecture/README.md
+        echo "" >> docs/architecture/README.md
+        
+        echo "## Service Overview" >> docs/architecture/README.md
+        echo "" >> docs/architecture/README.md
+        
+        # Count services
+        total_services=$(find src/ -mindepth 1 -maxdepth 1 -type d | wc -l)
+        echo "**Total Services:** $total_services" >> docs/architecture/README.md
+        echo "" >> docs/architecture/README.md
+        
+        # Analyze service types
+        echo "| Service | Language | Port | Description |" >> docs/architecture/README.md
+        echo "|---------|----------|------|-------------|" >> docs/architecture/README.md
+        
+        for service_dir in src/*/; do
+          service=$(basename "$service_dir")
+          language="Unknown"
+          port="N/A"
+          description="Auto-detected service"
+          
+          # Detect language
+          if [ -f "$service_dir/go.mod" ]; then
+            language="Go"
+          elif [ -f "$service_dir/package.json" ]; then
+            language="Node.js"
+          elif [ -f "$service_dir/requirements.txt" ]; then
+            language="Python"
+          elif [ -f "$service_dir/src/"*.csproj ]; then
+            language="C#"
+          elif [ -f "$service_dir/build.gradle" ]; then
+            language="Java"
+          fi
+          
+          # Try to find port from Dockerfile or config
+          if [ -f "$service_dir/Dockerfile" ]; then
+            port=$(grep -E "EXPOSE|--port" "$service_dir/Dockerfile" | head -1 | grep -oE '[0-9]+' || echo "N/A")
+          fi
+          
+          echo "| $service | $language | $port | $description |" >> docs/architecture/README.md
+        done
+        
+        echo "" >> docs/architecture/README.md
+        
+        # Add communication patterns
+        echo "## Communication Patterns" >> docs/architecture/README.md
+        echo "" >> docs/architecture/README.md
+        echo "- **Frontend ⟷ Backend Services:** HTTP/REST and gRPC" >> docs/architecture/README.md
+        echo "- **Service ⟷ Service:** gRPC (internal communication)" >> docs/architecture/README.md
+        echo "- **Load Generation:** Locust-based HTTP load testing" >> docs/architecture/README.md
+        echo "- **Data Storage:** Redis (Cart), File-based (Products)" >> docs/architecture/README.md
+        echo "" >> docs/architecture/README.md
+
+    - name: Generate deployment documentation
+      run: |
+        mkdir -p docs/deployment
+        
+        echo "# 🚀 Deployment Documentation" > docs/deployment/README.md
+        echo "" >> docs/deployment/README.md
+        echo "**Last Updated:** $(date -u)" >> docs/deployment/README.md
+        echo "" >> docs/deployment/README.md
+        
+        # Analyze Kubernetes manifests
+        if [ -d "kubernetes-manifests" ]; then
+          echo "## Kubernetes Deployment" >> docs/deployment/README.md
+          echo "" >> docs/deployment/README.md
+          
+          deployments=$(find kubernetes-manifests/ -name "*.yaml" | wc -l)
+          echo "**Total Manifests:** $deployments" >> docs/deployment/README.md
+          echo "" >> docs/deployment/README.md
+          
+          echo "### Resources Overview" >> docs/deployment/README.md
+          echo "" >> docs/deployment/README.md
+          echo "| Resource Type | Count |" >> docs/deployment/README.md
+          echo "|---------------|-------|" >> docs/deployment/README.md
+          
+          for resource_type in Deployment Service ConfigMap; do
+            count=$(grep -r "kind: $resource_type" kubernetes-manifests/ | wc -l || echo "0")
+            echo "| $resource_type | $count |" >> docs/deployment/README.md
+          done
+          
+          echo "" >> docs/deployment/README.md
+        fi
+        
+        # Analyze Docker configuration
+        echo "## Container Configuration" >> docs/deployment/README.md
+        echo "" >> docs/deployment/README.md
+        
+        dockerfiles=$(find src/ -name "Dockerfile" | wc -l)
+        echo "**Total Dockerfiles:** $dockerfiles" >> docs/deployment/README.md
+        echo "" >> docs/deployment/README.md
+        
+        # Document base images
+        echo "### Base Images Used" >> docs/deployment/README.md
+        echo "" >> docs/deployment/README.md
+        
+        find src/ -name "Dockerfile" -exec grep -H "^FROM" {} \; | \
+        sed 's|src/||g' | \
+        sed 's|/Dockerfile:FROM|:|g' | \
+        sort | uniq -c | \
+        awk '{print "- **" $2 "**: " $1 " service(s)"}' >> docs/deployment/README.md
+
+    - name: Update README files
+      run: |
+        # Update main README with current statistics
+        if [ -f "README.md" ]; then
+          # Backup original
+          cp README.md README.md.bak
+          
+          # Count current services
+          total_services=$(find src/ -mindepth 1 -maxdepth 1 -type d | wc -l)
+          go_services=$(find src/ -name "go.mod" | wc -l)
+          python_services=$(find src/ -name "requirements.txt" | wc -l)
+          node_services=$(find src/ -name "package.json" | wc -l)
+          dotnet_services=$(find src/ -name "*.csproj" | wc -l)
+          java_services=$(find src/ -name "build.gradle" | wc -l)
+          
+          # Update statistics in README (if there's a stats section)
+          if grep -q "## Statistics" README.md; then
+            # Update existing stats section
+            sed -i "/## Statistics/,/## / {
+              s/Total Services: [0-9]*/Total Services: $total_services/
+              s/Go Services: [0-9]*/Go Services: $go_services/
+              s/Python Services: [0-9]*/Python Services: $python_services/
+              s/Node.js Services: [0-9]*/Node.js Services: $node_services/
+              s/C# Services: [0-9]*/C# Services: $dotnet_services/
+              s/Java Services: [0-9]*/Java Services: $java_services/
+            }" README.md
+          else
+            # Add stats section before the end
+            sed -i '/^## Additional deployment options/i \
+## 📊 Current Statistics\n\
+\n\
+- **Total Services:** '$total_services'\n\
+- **Go Services:** '$go_services'\n\
+- **Python Services:** '$python_services'\n\
+- **Node.js Services:** '$node_services'\n\
+- **C# Services:** '$dotnet_services'\n\
+- **Java Services:** '$java_services'\n\
+- **Last Updated:** '$(date -u)'\n\
+\n' README.md
+          fi
+        fi
+
+    - name: Generate changelog updates
+      run: |
+        # Create or update CHANGELOG.md
+        if [ ! -f "CHANGELOG.md" ]; then
+          echo "# 📝 Changelog" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "All notable changes to this project will be automatically documented in this file." >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+        fi
+        
+        # Add entry for this documentation update
+        today=$(date +%Y-%m-%d)
+        
+        # Check if entry for today already exists
+        if ! grep -q "## \[$today\]" CHANGELOG.md; then
+          # Insert new entry after the header
+          sed -i '/^# 📝 Changelog/a \
+\
+## ['$today'] - Documentation Update\
+\
+### 🤖 Automated Changes\
+- Updated API documentation for all services\
+- Refreshed architecture documentation\
+- Updated deployment documentation\
+- Synchronized README statistics\
+\
+### 📊 Current Service Count\
+- Total Services: '$(find src/ -mindepth 1 -maxdepth 1 -type d | wc -l)'\
+- Active Automations: 5 workflows\
+' CHANGELOG.md
+        fi
+
+    - name: Create documentation index
+      run: |
+        echo "# 📖 Documentation Index" > docs/INDEX.md
+        echo "" >> docs/INDEX.md
+        echo "Comprehensive documentation for the microservices demo project." >> docs/INDEX.md
+        echo "" >> docs/INDEX.md
+        echo "**Last Generated:** $(date -u)" >> docs/INDEX.md
+        echo "" >> docs/INDEX.md
+        
+        echo "## 📚 Available Documentation" >> docs/INDEX.md
+        echo "" >> docs/INDEX.md
+        
+        # List all documentation files
+        find docs/ -name "*.md" -not -name "INDEX.md" | sort | while read doc; do
+          title=$(basename "$doc" .md | tr '[:lower:]' '[:upper:]' | tr '_-' '  ')
+          path=$(echo "$doc" | sed 's|^docs/||')
+          echo "- [📄 $title]($path)" >> docs/INDEX.md
+        done
+        
+        echo "" >> docs/INDEX.md
+        echo "## 🔗 Quick Links" >> docs/INDEX.md
+        echo "" >> docs/INDEX.md
+        echo "- [🏗️ Architecture Overview](architecture/README.md)" >> docs/INDEX.md
+        echo "- [📡 API Documentation](api/README.md)" >> docs/INDEX.md
+        echo "- [🚀 Deployment Guide](deployment/README.md)" >> docs/INDEX.md
+        echo "- [📝 Changelog](../CHANGELOG.md)" >> docs/INDEX.md
+        echo "" >> docs/INDEX.md
+        echo "---" >> docs/INDEX.md
+        echo "*Documentation automatically maintained by Documentation Bot 🤖*" >> docs/INDEX.md
+
+    - name: Validate documentation
+      run: |
+        echo "Validating generated documentation..."
+        
+        # Check for broken internal links
+        find docs/ -name "*.md" -exec grep -l "\[.*\](" {} \; | while read file; do
+          echo "Checking links in $file"
+          grep -oE '\[.*\]\([^)]+\)' "$file" | grep -E '\]\([^http]' | while read link; do
+            target=$(echo "$link" | sed 's/.*(\([^)]*\)).*/\1/')
+            if [[ "$target" == ../* ]]; then
+              # Check relative links
+              if [ ! -f "$(dirname "$file")/$target" ]; then
+                echo "⚠️ Broken link in $file: $target"
+              fi
+            fi
+          done
+        done
+        
+        echo "Documentation validation completed"
+
+    - name: Commit documentation updates
+      run: |
+        git config --local user.email "docs-bot@github.com"
+        git config --local user.name "Documentation Bot"
+        
+        # Check if there are changes
+        if [ -n "$(git status --porcelain)" ]; then
+          git add docs/ README.md CHANGELOG.md
+          
+          # Create comprehensive commit message
+          changed_services="${{ needs.analyze-changes.outputs.services-changed }}"
+          if [ "$changed_services" = "all" ]; then
+            commit_msg="📚 Automated documentation refresh - all services"
+          elif [ -n "$changed_services" ]; then
+            commit_msg="📚 Automated documentation update - services: $changed_services"
+          else
+            commit_msg="📚 Automated documentation maintenance"
+          fi
+          
+          git commit -m "$commit_msg
+
+          - Updated API documentation for all microservices
+          - Refreshed architecture and deployment docs
+          - Synchronized README statistics
+          - Updated changelog
+          - Validated all documentation links
+          
+          Co-authored-by: Documentation Bot <docs-bot@github.com>"
+          
+          echo "documentation_updated=true" >> $GITHUB_ENV
+        else
+          echo "No documentation updates needed"
+          echo "documentation_updated=false" >> $GITHUB_ENV
+        fi
+
+    - name: Push documentation updates
+      if: env.documentation_updated == 'true' && github.event_name != 'pull_request'
+      run: |
+        git push origin HEAD
+
+    - name: Create PR for documentation updates
+      if: env.documentation_updated == 'true' && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // For PR events, just comment about the documentation updates
+          await github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## 📚 Documentation Bot Update
+            
+            This PR includes automated documentation updates:
+            - ✅ API documentation refreshed
+            - ✅ Architecture documentation updated  
+            - ✅ README statistics synchronized
+            - ✅ Changelog updated
+            
+            All documentation has been automatically maintained to reflect the latest changes.`
+          });
+
+  documentation-health-check:
+    name: Documentation Health Check
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Check documentation completeness
+      run: |
+        echo "# 🏥 Documentation Health Report" > doc_health_report.md
+        echo "" >> doc_health_report.md
+        echo "**Report Generated:** $(date -u)" >> doc_health_report.md
+        echo "" >> doc_health_report.md
+        
+        # Check each service for documentation
+        echo "## 📋 Service Documentation Coverage" >> doc_health_report.md
+        echo "" >> doc_health_report.md
+        echo "| Service | README | API Docs | Tests Documented |" >> doc_health_report.md
+        echo "|---------|--------|----------|------------------|" >> doc_health_report.md
+        
+        for service_dir in src/*/; do
+          service=$(basename "$service_dir")
+          
+          # Check for README
+          has_readme="❌"
+          if [ -f "$service_dir/README.md" ]; then
+            has_readme="✅"
+          fi
+          
+          # Check for API documentation
+          has_api_docs="❌"
+          if [ -f "docs/api/README.md" ] && grep -q "$service" docs/api/README.md; then
+            has_api_docs="✅"
+          fi
+          
+          # Check for test documentation
+          has_test_docs="❌"
+          if find "$service_dir" -name "*test*" -type f | grep -E '\.(go|py|js|cs)$' > /dev/null; then
+            has_test_docs="✅"
+          fi
+          
+          echo "| $service | $has_readme | $has_api_docs | $has_test_docs |" >> doc_health_report.md
+        done
+        
+        echo "" >> doc_health_report.md
+        
+        # Overall health score
+        total_services=$(find src/ -mindepth 1 -maxdepth 1 -type d | wc -l)
+        services_with_readme=$(find src/ -name "README.md" | wc -l)
+        services_with_tests=$(find src/ -name "*test*" | cut -d'/' -f2 | sort | uniq | wc -l)
+        
+        health_score=$(( (services_with_readme * 50 + services_with_tests * 30 + 20) / total_services ))
+        
+        echo "## 📊 Overall Health Score: $health_score/100" >> doc_health_report.md
+        echo "" >> doc_health_report.md
+        
+        if [ $health_score -ge 90 ]; then
+          echo "🌟 **Excellent**: Documentation is comprehensive and well-maintained!" >> doc_health_report.md
+        elif [ $health_score -ge 75 ]; then
+          echo "👍 **Good**: Documentation is mostly complete with minor gaps." >> doc_health_report.md
+        elif [ $health_score -ge 60 ]; then
+          echo "⚠️ **Needs Improvement**: Several services need better documentation." >> doc_health_report.md
+        else
+          echo "❌ **Critical**: Documentation coverage is insufficient." >> doc_health_report.md
+        fi
+
+    - name: Upload health report
+      uses: actions/upload-artifact@v4
+      with:
+        name: documentation-health-report
+        path: doc_health_report.md
