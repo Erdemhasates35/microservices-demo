@@ -1,0 +1,305 @@
+# Copyright 2024 Automated Enhancement
+#
+# Automated Code Quality and Security Scanning Workflow
+# This workflow provides comprehensive code quality checks, security scanning,
+# and automated improvements for the microservices demo project.
+
+name: "Automated Code Quality & Security"
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    # Run daily at 2 AM UTC for security scans
+    - cron: '0 2 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.23'
+  DOTNET_VERSION: '9.0'
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  code-quality-analysis:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    # Go Code Quality
+    - name: Go Lint and Format Check
+      run: |
+        # Install golangci-lint
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.55.2
+        
+        GO_SERVICES="shippingservice productcatalogservice checkoutservice frontend"
+        for service in $GO_SERVICES; do
+          echo "Running quality checks for $service"
+          cd src/$service
+          
+          # Format check
+          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+            echo "Go code in $service needs formatting:"
+            gofmt -s -l .
+            exit 1
+          fi
+          
+          # Lint
+          $(go env GOPATH)/bin/golangci-lint run --timeout=5m
+          
+          # Vet
+          go vet ./...
+          
+          cd ../..
+        done
+
+    # .NET Code Quality
+    - name: .NET Code Analysis
+      run: |
+        cd src/cartservice
+        
+        # Restore packages
+        dotnet restore
+        
+        # Build to check for compilation errors
+        dotnet build --no-restore --configuration Release
+        
+        # Run code analysis
+        dotnet build --no-restore --verbosity normal
+
+    # Node.js Code Quality
+    - name: Node.js Code Quality
+      run: |
+        NODE_SERVICES="currencyservice paymentservice"
+        for service in $NODE_SERVICES; do
+          echo "Running quality checks for $service"
+          cd src/$service
+          
+          # Install dependencies
+          npm ci
+          
+          # Audit for security vulnerabilities
+          npm audit --audit-level=high
+          
+          # Check if prettier is configured and run it
+          if [ -f package.json ] && npm list --depth=0 prettier > /dev/null 2>&1; then
+            npx prettier --check .
+          fi
+          
+          cd ../..
+        done
+
+    # Python Code Quality
+    - name: Python Code Quality
+      run: |
+        # Install quality tools
+        pip install flake8 black isort bandit safety
+        
+        PYTHON_SERVICES="emailservice recommendationservice loadgenerator shoppingassistantservice"
+        for service in $PYTHON_SERVICES; do
+          echo "Running quality checks for $service"
+          cd src/$service
+          
+          # Install dependencies
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          
+          # Format check
+          black --check --diff .
+          
+          # Import sorting
+          isort --check-only --diff .
+          
+          # Linting
+          flake8 . --max-line-length=88 --extend-ignore=E203,W503
+          
+          # Security check
+          bandit -r . -f json -o ../../bandit-report-$service.json || true
+          
+          # Dependency security check
+          if [ -f requirements.txt ]; then
+            safety check -r requirements.txt --json --output ../../safety-report-$service.json || true
+          fi
+          
+          cd ../..
+        done
+
+    # Upload security reports as artifacts
+    - name: Upload Security Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-reports
+        path: |
+          *-report-*.json
+        retention-days: 30
+
+  dependency-analysis:
+    name: Dependency Security Analysis
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  docker-security-scan:
+    name: Docker Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        service: [
+          'emailservice',
+          'productcatalogservice', 
+          'recommendationservice',
+          'shippingservice',
+          'checkoutservice',
+          'paymentservice',
+          'currencyservice',
+          'cartservice',
+          'frontend',
+          'adservice'
+        ]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build Docker image
+      run: |
+        if [ "${{ matrix.service }}" = "cartservice" ]; then
+          docker build -t ${{ matrix.service }}:test src/${{ matrix.service }}/src
+        else
+          docker build -t ${{ matrix.service }}:test src/${{ matrix.service }}
+        fi
+
+    - name: Run Trivy scanner on Docker image
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: '${{ matrix.service }}:test'
+        format: 'table'
+        exit-code: '1'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
+
+  automated-fixes:
+    name: Automated Code Fixes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        ref: ${{ github.head_ref }}
+
+    - name: Setup tools
+      run: |
+        # Install formatting tools
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.55.2
+        pip install black isort
+        npm install -g prettier
+
+    - name: Auto-fix Go code
+      run: |
+        GO_SERVICES="shippingservice productcatalogservice checkoutservice frontend"
+        for service in $GO_SERVICES; do
+          cd src/$service
+          gofmt -s -w .
+          go mod tidy
+          cd ../..
+        done
+
+    - name: Auto-fix Python code
+      run: |
+        PYTHON_SERVICES="emailservice recommendationservice loadgenerator shoppingassistantservice"
+        for service in $PYTHON_SERVICES; do
+          cd src/$service
+          isort .
+          black .
+          cd ../..
+        done
+
+    - name: Auto-fix Node.js code
+      run: |
+        NODE_SERVICES="currencyservice paymentservice"
+        for service in $NODE_SERVICES; do
+          cd src/$service
+          if [ -f package.json ]; then
+            npm ci
+            if npm list --depth=0 prettier > /dev/null 2>&1; then
+              npx prettier --write .
+            fi
+          fi
+          cd ../..
+        done
+
+    - name: Commit automated fixes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "Automated Quality Bot"
+        
+        if [ -n "$(git status --porcelain)" ]; then
+          git add .
+          git commit -m "🤖 Automated code quality fixes"
+          git push
+          
+          # Add comment to PR
+          if [ -n "${{ github.event.pull_request.number }}" ]; then
+            curl -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+              -d '{"body":"🤖 **Automated Quality Bot** has applied code formatting and style fixes to improve code quality."}'
+          fi
+        else
+          echo "No automated fixes needed - code quality is already excellent! ✨"
+        fi

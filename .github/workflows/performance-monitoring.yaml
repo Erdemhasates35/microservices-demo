@@ -1,0 +1,590 @@
+# Copyright 2024 Automated Enhancement
+#
+# Automated Performance Monitoring and Reporting
+# Continuous performance tracking with automated alerts
+
+name: "Performance Monitoring & Reporting"
+on:
+  schedule:
+    # Run every 4 hours
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to monitor'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      duration:
+        description: 'Test duration in minutes'
+        required: false
+        default: '10'
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+
+env:
+  STAGING_URL: "http://staging.microservices-demo.com"
+  PRODUCTION_URL: "http://microservices-demo.com"
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  performance-baseline:
+    name: Establish Performance Baseline
+    runs-on: ubuntu-latest
+    outputs:
+      baseline-established: ${{ steps.baseline.outputs.established }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python for performance testing
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install performance testing tools
+      run: |
+        pip install locust requests numpy matplotlib seaborn pandas
+        sudo apt-get update
+        sudo apt-get install -y curl jq
+
+    - name: Check for existing baseline
+      id: baseline
+      run: |
+        if [ -f "performance_baseline.json" ]; then
+          echo "established=true" >> $GITHUB_OUTPUT
+          echo "Existing baseline found"
+        else
+          echo "established=false" >> $GITHUB_OUTPUT
+          echo "No baseline found - will establish new baseline"
+        fi
+
+  load-testing:
+    name: Automated Load Testing
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [staging, production]
+        include:
+        - environment: staging
+          url: "http://staging.microservices-demo.com"
+          users: 10
+          spawn_rate: 2
+        - environment: production
+          url: "http://microservices-demo.com"  
+          users: 5
+          spawn_rate: 1
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        cd src/loadgenerator
+        pip install -r requirements.txt
+        pip install matplotlib seaborn pandas
+
+    - name: Check service availability
+      run: |
+        echo "Checking ${{ matrix.environment }} availability at ${{ matrix.url }}"
+        
+        # Try to connect to the service
+        max_attempts=5
+        attempt=1
+        
+        while [ $attempt -le $max_attempts ]; do
+          if curl -f -s "${{ matrix.url }}" > /dev/null; then
+            echo "✅ Service is available"
+            break
+          else
+            echo "❌ Service unavailable, attempt $attempt/$max_attempts"
+            if [ $attempt -eq $max_attempts ]; then
+              echo "Service is not available - skipping load test"
+              echo "service_available=false" >> $GITHUB_ENV
+              exit 0
+            fi
+            sleep 30
+          fi
+          attempt=$((attempt + 1))
+        done
+        
+        echo "service_available=true" >> $GITHUB_ENV
+
+    - name: Run load test
+      if: env.service_available == 'true'
+      run: |
+        cd src/loadgenerator
+        
+        # Determine test duration
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          DURATION="${{ inputs.duration }}m"
+        else
+          DURATION="5m"
+        fi
+        
+        echo "Running load test for $DURATION with ${{ matrix.users }} users"
+        
+        # Create a custom locustfile with our parameters
+        cat > test_locustfile.py << 'EOF'
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from locustfile import *
+
+# Override the host
+if len(sys.argv) > 1:
+    WebsiteUser.host = sys.argv[1]
+EOF
+        
+        # Run locust in headless mode
+        timeout ${DURATION} locust \
+          -f test_locustfile.py \
+          --host=${{ matrix.url }} \
+          --users ${{ matrix.users }} \
+          --spawn-rate ${{ matrix.spawn_rate }} \
+          --run-time ${DURATION} \
+          --html performance_report_${{ matrix.environment }}.html \
+          --csv performance_data_${{ matrix.environment }} \
+          --headless || true
+        
+        echo "Load test completed for ${{ matrix.environment }}"
+
+    - name: Parse performance results
+      if: env.service_available == 'true'
+      run: |
+        cd src/loadgenerator
+        
+        # Create performance analysis script
+        cat > analyze_performance.py << 'EOF'
+import pandas as pd
+import json
+import os
+import sys
+
+env = sys.argv[1] if len(sys.argv) > 1 else 'staging'
+
+try:
+    # Read the stats CSV file
+    stats_df = pd.read_csv(f'performance_data_{env}_stats.csv')
+    failures_df = pd.read_csv(f'performance_data_{env}_failures.csv', nrows=0)  # Just check if exists
+    
+    # Calculate key metrics
+    total_requests = stats_df['Request Count'].sum()
+    total_failures = stats_df['Failure Count'].sum()
+    avg_response_time = stats_df['Average Response Time'].mean()
+    max_response_time = stats_df['Max Response Time'].max()
+    requests_per_second = stats_df['Requests/s'].mean()
+    
+    # Calculate success rate
+    success_rate = ((total_requests - total_failures) / total_requests * 100) if total_requests > 0 else 0
+    
+    # Performance thresholds
+    performance_grade = "A"
+    issues = []
+    
+    if avg_response_time > 2000:
+        performance_grade = "C"
+        issues.append("High average response time")
+    elif avg_response_time > 1000:
+        performance_grade = "B"
+        issues.append("Moderate response time")
+    
+    if success_rate < 95:
+        performance_grade = "F"
+        issues.append("Low success rate")
+    elif success_rate < 99:
+        performance_grade = "C" if performance_grade == "A" else performance_grade
+        issues.append("Some failures detected")
+    
+    if requests_per_second < 1:
+        performance_grade = "D"
+        issues.append("Low throughput")
+    
+    # Create results
+    results = {
+        'environment': env,
+        'total_requests': int(total_requests),
+        'total_failures': int(total_failures),
+        'success_rate': round(success_rate, 2),
+        'avg_response_time': round(avg_response_time, 2),
+        'max_response_time': round(max_response_time, 2),
+        'requests_per_second': round(requests_per_second, 2),
+        'performance_grade': performance_grade,
+        'issues': issues,
+        'timestamp': pd.Timestamp.now().isoformat()
+    }
+    
+    # Save results
+    with open(f'performance_results_{env}.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"Performance analysis completed for {env}")
+    print(f"Grade: {performance_grade}")
+    print(f"Success Rate: {success_rate}%")
+    print(f"Avg Response Time: {avg_response_time}ms")
+    
+except Exception as e:
+    print(f"Error analyzing performance data: {e}")
+    # Create minimal results in case of error
+    results = {
+        'environment': env,
+        'error': str(e),
+        'timestamp': pd.Timestamp.now().isoformat()
+    }
+    with open(f'performance_results_{env}.json', 'w') as f:
+        json.dump(results, f, indent=2)
+EOF
+        
+        python analyze_performance.py ${{ matrix.environment }}
+
+    - name: Upload performance artifacts
+      if: env.service_available == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-results-${{ matrix.environment }}
+        path: |
+          src/loadgenerator/performance_report_${{ matrix.environment }}.html
+          src/loadgenerator/performance_data_${{ matrix.environment }}_*.csv
+          src/loadgenerator/performance_results_${{ matrix.environment }}.json
+
+  synthetic-monitoring:
+    name: Synthetic Monitoring Checks
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [staging, production]
+        include:
+        - environment: staging
+          url: "http://staging.microservices-demo.com"
+        - environment: production
+          url: "http://microservices-demo.com"
+    steps:
+    - name: Synthetic health checks
+      run: |
+        echo "Running synthetic monitoring for ${{ matrix.environment }}"
+        
+        # Initialize results
+        results=()
+        total_score=0
+        max_score=0
+        
+        # Test 1: Homepage load time
+        echo "Testing homepage load time..."
+        start_time=$(date +%s%N)
+        if curl -f -s "${{ matrix.url }}" > /dev/null; then
+          end_time=$(date +%s%N)
+          load_time=$(( (end_time - start_time) / 1000000 )) # Convert to ms
+          
+          if [ $load_time -lt 2000 ]; then
+            results+=("✅ Homepage load: ${load_time}ms (Excellent)")
+            total_score=$((total_score + 25))
+          elif [ $load_time -lt 5000 ]; then
+            results+=("⚠️ Homepage load: ${load_time}ms (Acceptable)")
+            total_score=$((total_score + 15))
+          else
+            results+=("❌ Homepage load: ${load_time}ms (Poor)")
+            total_score=$((total_score + 5))
+          fi
+        else
+          results+=("❌ Homepage: Unavailable")
+        fi
+        max_score=$((max_score + 25))
+        
+        # Test 2: API endpoints check
+        echo "Testing API endpoints..."
+        api_endpoints=(
+          "/api/products"
+          "/api/cart"
+          "/healthz"
+        )
+        
+        api_success=0
+        for endpoint in "${api_endpoints[@]}"; do
+          if curl -f -s "${{ matrix.url }}$endpoint" > /dev/null 2>&1; then
+            api_success=$((api_success + 1))
+          fi
+        done
+        
+        api_score=$(( api_success * 25 / ${#api_endpoints[@]} ))
+        total_score=$((total_score + api_score))
+        max_score=$((max_score + 25))
+        results+=("📡 API endpoints: $api_success/${#api_endpoints[@]} working")
+        
+        # Test 3: SSL/TLS check (if HTTPS)
+        if [[ "${{ matrix.url }}" == https* ]]; then
+          echo "Testing SSL/TLS..."
+          if echo | openssl s_client -connect $(echo "${{ matrix.url }}" | cut -d'/' -f3):443 2>/dev/null | grep -q "Verify return code: 0"; then
+            results+=("🔒 SSL/TLS: Valid certificate")
+            total_score=$((total_score + 25))
+          else
+            results+=("⚠️ SSL/TLS: Certificate issues")
+            total_score=$((total_score + 10))
+          fi
+          max_score=$((max_score + 25))
+        fi
+        
+        # Test 4: Response headers check
+        echo "Checking security headers..."
+        headers=$(curl -I -s "${{ matrix.url }}" 2>/dev/null || echo "")
+        security_score=0
+        
+        if echo "$headers" | grep -q "X-Content-Type-Options"; then
+          security_score=$((security_score + 5))
+        fi
+        if echo "$headers" | grep -q "X-Frame-Options"; then
+          security_score=$((security_score + 5))
+        fi
+        if echo "$headers" | grep -q "Content-Security-Policy"; then
+          security_score=$((security_score + 10))
+        fi
+        if echo "$headers" | grep -q "Strict-Transport-Security"; then
+          security_score=$((security_score + 5))
+        fi
+        
+        total_score=$((total_score + security_score))
+        max_score=$((max_score + 25))
+        results+=("🛡️ Security headers: $security_score/25 points")
+        
+        # Calculate final score
+        final_score=$(( total_score * 100 / max_score ))
+        
+        # Create results file
+        echo "# 📊 Synthetic Monitoring Report - ${{ matrix.environment }}" > synthetic_report_${{ matrix.environment }}.md
+        echo "" >> synthetic_report_${{ matrix.environment }}.md
+        echo "**Environment:** ${{ matrix.environment }}" >> synthetic_report_${{ matrix.environment }}.md
+        echo "**URL:** ${{ matrix.url }}" >> synthetic_report_${{ matrix.environment }}.md
+        echo "**Timestamp:** $(date -u)" >> synthetic_report_${{ matrix.environment }}.md
+        echo "**Overall Score:** $final_score/100" >> synthetic_report_${{ matrix.environment }}.md
+        echo "" >> synthetic_report_${{ matrix.environment }}.md
+        echo "## Test Results:" >> synthetic_report_${{ matrix.environment }}.md
+        echo "" >> synthetic_report_${{ matrix.environment }}.md
+        
+        for result in "${results[@]}"; do
+          echo "- $result" >> synthetic_report_${{ matrix.environment }}.md
+        done
+        
+        echo "" >> synthetic_report_${{ matrix.environment }}.md
+        
+        # Add grade
+        if [ $final_score -ge 90 ]; then
+          echo "**Grade: A** 🌟 - Excellent performance" >> synthetic_report_${{ matrix.environment }}.md
+        elif [ $final_score -ge 80 ]; then
+          echo "**Grade: B** 👍 - Good performance" >> synthetic_report_${{ matrix.environment }}.md
+        elif [ $final_score -ge 70 ]; then
+          echo "**Grade: C** ⚠️ - Acceptable performance" >> synthetic_report_${{ matrix.environment }}.md
+        elif [ $final_score -ge 60 ]; then
+          echo "**Grade: D** 🔧 - Needs improvement" >> synthetic_report_${{ matrix.environment }}.md
+        else
+          echo "**Grade: F** ❌ - Critical issues" >> synthetic_report_${{ matrix.environment }}.md
+        fi
+        
+        # Save score for later use
+        echo "$final_score" > synthetic_score_${{ matrix.environment }}.txt
+
+    - name: Upload synthetic monitoring results
+      uses: actions/upload-artifact@v4
+      with:
+        name: synthetic-monitoring-${{ matrix.environment }}
+        path: |
+          synthetic_report_${{ matrix.environment }}.md
+          synthetic_score_${{ matrix.environment }}.txt
+
+  performance-reporting:
+    name: Generate Performance Report
+    runs-on: ubuntu-latest
+    needs: [load-testing, synthetic-monitoring]
+    if: always()
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Generate comprehensive report
+      run: |
+        echo "# 📈 Automated Performance Monitoring Report" > performance_report.md
+        echo "" >> performance_report.md
+        echo "**Report Generated:** $(date -u)" >> performance_report.md
+        echo "**Triggered by:** ${{ github.event_name }}" >> performance_report.md
+        echo "**Commit:** ${{ github.sha }}" >> performance_report.md
+        echo "" >> performance_report.md
+        
+        # Process load testing results
+        echo "## 🚀 Load Testing Results" >> performance_report.md
+        echo "" >> performance_report.md
+        
+        for env in staging production; do
+          if [ -d "performance-results-$env" ]; then
+            echo "### $env Environment" >> performance_report.md
+            
+            if [ -f "performance-results-$env/performance_results_$env.json" ]; then
+              # Parse JSON results
+              grade=$(jq -r '.performance_grade // "N/A"' "performance-results-$env/performance_results_$env.json")
+              success_rate=$(jq -r '.success_rate // "N/A"' "performance-results-$env/performance_results_$env.json")
+              avg_time=$(jq -r '.avg_response_time // "N/A"' "performance-results-$env/performance_results_$env.json")
+              rps=$(jq -r '.requests_per_second // "N/A"' "performance-results-$env/performance_results_$env.json")
+              
+              echo "- **Grade:** $grade" >> performance_report.md
+              echo "- **Success Rate:** $success_rate%" >> performance_report.md
+              echo "- **Avg Response Time:** ${avg_time}ms" >> performance_report.md
+              echo "- **Requests/Second:** $rps" >> performance_report.md
+              
+              # Add issues if any
+              issues=$(jq -r '.issues[]? // empty' "performance-results-$env/performance_results_$env.json")
+              if [ -n "$issues" ]; then
+                echo "- **Issues:**" >> performance_report.md
+                echo "$issues" | while read issue; do
+                  echo "  - ⚠️ $issue" >> performance_report.md
+                done
+              fi
+            else
+              echo "❌ Load testing data not available" >> performance_report.md
+            fi
+            echo "" >> performance_report.md
+          fi
+        done
+        
+        # Process synthetic monitoring results
+        echo "## 🔍 Synthetic Monitoring Results" >> performance_report.md
+        echo "" >> performance_report.md
+        
+        for env in staging production; do
+          if [ -d "synthetic-monitoring-$env" ]; then
+            echo "### $env Environment" >> performance_report.md
+            echo "" >> performance_report.md
+            
+            if [ -f "synthetic-monitoring-$env/synthetic_report_$env.md" ]; then
+              # Extract key info from synthetic report
+              cat "synthetic-monitoring-$env/synthetic_report_$env.md" | grep -E "(Overall Score|Grade|Test Results)" -A 20 >> performance_report.md
+            fi
+            echo "" >> performance_report.md
+          fi
+        done
+        
+        # Add recommendations
+        echo "## 💡 Recommendations" >> performance_report.md
+        echo "" >> performance_report.md
+        
+        # Check if there are any performance issues
+        has_issues=false
+        
+        for env in staging production; do
+          if [ -f "performance-results-$env/performance_results_$env.json" ]; then
+            grade=$(jq -r '.performance_grade // "A"' "performance-results-$env/performance_results_$env.json")
+            if [ "$grade" != "A" ]; then
+              has_issues=true
+            fi
+          fi
+          
+          if [ -f "synthetic-monitoring-$env/synthetic_score_$env.txt" ]; then
+            score=$(cat "synthetic-monitoring-$env/synthetic_score_$env.txt")
+            if [ "$score" -lt 80 ]; then
+              has_issues=true
+            fi
+          fi
+        done
+        
+        if [ "$has_issues" = true ]; then
+          echo "### Performance Optimization Suggestions:" >> performance_report.md
+          echo "- Consider implementing caching strategies" >> performance_report.md
+          echo "- Review database query performance" >> performance_report.md
+          echo "- Analyze resource allocation and scaling" >> performance_report.md
+          echo "- Implement CDN for static assets" >> performance_report.md
+          echo "- Review security headers configuration" >> performance_report.md
+        else
+          echo "✅ **All systems performing optimally!**" >> performance_report.md
+          echo "" >> performance_report.md
+          echo "Current performance metrics meet or exceed targets. Continue monitoring to maintain these standards." >> performance_report.md
+        fi
+        
+        echo "" >> performance_report.md
+        echo "---" >> performance_report.md
+        echo "*This report was automatically generated by the Performance Monitoring Bot 🤖*" >> performance_report.md
+
+    - name: Create performance issue if problems detected
+      if: github.event_name == 'schedule'
+      run: |
+        # Check if we need to create a performance issue
+        create_issue=false
+        
+        for env in staging production; do
+          if [ -f "performance-results-$env/performance_results_$env.json" ]; then
+            grade=$(jq -r '.performance_grade // "A"' "performance-results-$env/performance_results_$env.json")
+            if [ "$grade" = "D" ] || [ "$grade" = "F" ]; then
+              create_issue=true
+              echo "Critical performance issue detected in $env"
+            fi
+          fi
+        done
+        
+        echo "create_issue=$create_issue" >> $GITHUB_ENV
+
+    - name: Create GitHub issue for performance problems
+      if: env.create_issue == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('performance_report.md', 'utf8');
+          
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: '🚨 Performance Alert: Critical Issues Detected',
+            body: `${report}\n\n**Alert Level:** Critical\n**Auto-generated:** Yes\n**Action Required:** Please review and address the performance issues identified above.`,
+            labels: ['performance', 'critical', 'automated-alert']
+          });
+
+    - name: Upload comprehensive report
+      uses: actions/upload-artifact@v4
+      with:
+        name: comprehensive-performance-report
+        path: performance_report.md
+
+    - name: Comment on recent PRs if performance regression
+      if: github.event_name == 'push'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          // Get recent PRs that might be related
+          const { data: prs } = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'closed',
+            sort: 'updated',
+            direction: 'desc',
+            per_page: 5
+          });
+          
+          const recentPR = prs.find(pr => pr.merge_commit_sha === context.sha);
+          
+          if (recentPR) {
+            const report = fs.readFileSync('performance_report.md', 'utf8');
+            
+            await github.rest.issues.createComment({
+              issue_number: recentPR.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📈 Post-Merge Performance Report\n\n${report}`
+            });
+          }
