@@ -1,4 +1,4 @@
-flask==3.1.0
+flask==3.1.1
 langchain-google-genai==2.0.9
 langchain==0.3.18
 pillow==11.1.0
