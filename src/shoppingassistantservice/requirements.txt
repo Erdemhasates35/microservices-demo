@@ -31,13 +31,13 @@ certifi==2025.1.31
     #   httpcore
     #   httpx
     #   requests
-cffi==1.17.1
+cffi==2.0.0
     # via cryptography
 charset-normalizer==3.4.1
     # via requests
 click==8.1.8
     # via flask
-cryptography==44.0.1
+cryptography==46.0.6
     # via google-cloud-alloydb-connector
 filetype==1.2.0
     # via langchain-google-genai
@@ -211,7 +211,7 @@ pyyaml==6.0.2
     # via
     #   langchain
     #   langchain-core
-requests==2.32.3
+requests==2.33.0
     # via
     #   google-api-core
     #   google-cloud-alloydb-connector
